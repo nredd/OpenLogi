@@ -1,0 +1,99 @@
+# Fork-only: builds an unsigned-then-ad-hoc-signed arm64 OpenLogi.app for the nredd/tap cask.
+# Not part of the upstream PR. Upstream's signing/notarization secrets do not exist here, so
+# macOS treats this as a different app than the Developer ID build and asks for permissions again;
+# an ad-hoc signature also changes on every build, so each new release needs a re-grant.
+name: nredd release
+
+on:
+  push:
+    tags: ["v*-nredd.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  macos:
+    name: macOS arm64
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-cargo
+          shared-key: nredd-macos-release
+          cache-targets: false
+
+      - name: Select the Xcode the build uses
+        run: |
+          xcode=$(printf '%s\n' /Applications/Xcode_26*.app | sort -V | tail -1)
+          [ -d "$xcode" ] || { echo "No Xcode 26 on this runner" >&2; exit 1; }
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          echo "OPENLOGI_DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Install packaging tools
+        run: brew install librsvg create-dmg cargo-bundle
+
+      - name: Build and package (unsigned)
+        run: cargo run -p xtask -- macos package --target aarch64-apple-darwin
+
+      - name: Ad-hoc sign inside-out
+        run: |
+          set -euo pipefail
+          app="target/release/bundle/osx/OpenLogi.app"
+          ents="crates/openlogi-desktop/bundle/OpenLogi.entitlements"
+          helper="$app/Contents/Library/LoginItems/OpenLogi Agent.app"
+          overlay="$app/Contents/Library/LoginItems/OpenLogi Overlay.app"
+          cli="$app/Contents/MacOS/openlogi"
+          sign() { codesign --force --options runtime --timestamp=none "$@"; }
+          sign --sign - "$helper"
+          sign --sign - "$overlay"
+          sign --entitlements "$ents" --sign - "$cli"
+          sign --entitlements "$ents" --sign - "$app"
+          for t in "$app" "$helper" "$overlay" "$cli"; do codesign --verify --strict "$t"; done
+
+      - name: Verify identities and architecture
+        run: |
+          set -euo pipefail
+          app="target/release/bundle/osx/OpenLogi.app"
+          plist() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist"; }
+          [ "$(plist "$app" CFBundleIdentifier)" = "org.openlogi.openlogi" ]
+          [ "$(plist "$app/Contents/Library/LoginItems/OpenLogi Agent.app" CFBundleIdentifier)" = "org.openlogi.agent" ]
+          for b in "$app/Contents/MacOS/openlogi-desktop" \
+                   "$app/Contents/Library/LoginItems/OpenLogi Agent.app/Contents/MacOS/openlogi-agent" \
+                   "$app/Contents/Library/LoginItems/OpenLogi Overlay.app/Contents/MacOS/openlogi-overlay"; do
+            [ "$(lipo -archs "$b")" = "arm64" ]
+          done
+
+      - name: Zip and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          name="OpenLogi-${GITHUB_REF_NAME}-macos-arm64"
+          ditto -c -k --keepParent target/release/bundle/osx/OpenLogi.app "dist/$name.zip"
+          (cd dist && shasum -a 256 "$name.zip" | tee "$name.zip.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenLogi-macos-arm64
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Fork build of OpenLogi with phased horizontal thumb-wheel scroll. Ad-hoc signed: macOS asks for Accessibility and Input Monitoring again, and again after each new release."
